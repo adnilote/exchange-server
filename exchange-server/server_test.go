@@ -40,8 +40,6 @@ func init() {
 		ex = NewExchangeServer()
 	}()
 
-	ex.start()
-
 	ctx = context.Background()
 	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithDialer(bufDialer), grpc.WithInsecure())
 	if err != nil {
@@ -270,11 +268,12 @@ func TestResults(t *testing.T) {
 		time.Sleep(time.Nanosecond * 3)
 	}
 
+	stream, err := client.Results(ctx, myBrokerId)
+	if err != nil {
+		t.Error("Results return err: ", err)
+	}
+
 	for i := 0; i < len(deals); i++ {
-		stream, err := client.Results(ctx, myBrokerId)
-		if err != nil {
-			t.Error("Results return err: ", err)
-		}
 
 		result, err := stream.Recv()
 		if err == io.EOF {
@@ -284,15 +283,16 @@ func TestResults(t *testing.T) {
 		if err != nil {
 			t.Errorf("receive error %v", err)
 		}
-
 		found := false
 	dealLoop:
-		for _, deal := range deals {
+		for i, deal := range deals {
 			if deal.dealID.ID == result.ID {
 				if deal.partial != result.Partial {
 					t.Error("Expect partial, got =")
 				}
 				found = true
+				deals[i] = deals[0]
+				deals = deals[1:]
 				break dealLoop
 			}
 		}
@@ -300,6 +300,114 @@ func TestResults(t *testing.T) {
 			t.Error("No result")
 		}
 
+	}
+
+}
+func TestClosingStat(t *testing.T) {
+	stream, err := client.Statistic(ctx, myBrokerId)
+	if err != nil {
+		t.Error("Statisitcs return err: ", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		// receive data from stream
+		_, err := stream.Recv()
+		if err == io.EOF {
+			t.Error("stream closed from server side")
+			return
+		}
+		if err != nil {
+			t.Errorf("receive error %v", err)
+			continue
+		}
+	}
+	ex.brokers.b[myBrokerId.ID].close <- struct{}{}
+
+	_, err = stream.Recv()
+	if err == nil {
+		t.Errorf("stream must close from server side: %s", err)
+	}
+
+}
+func TestClosingResults(t *testing.T) {
+	deals := []struct {
+		deal    *exchange.Deal
+		partial bool
+		dealID  *exchange.DealID
+	}{
+		{
+			deal: &exchange.Deal{
+				Ticker:   "SPFB.RTS",
+				Amount:   -100,
+				Price:    11,
+				Time:     10000,
+				BrokerID: int32(myBrokerId.GetID()),
+			},
+			partial: false,
+		},
+
+		{
+			deal: &exchange.Deal{
+				Ticker:   "SPFB.RTS",
+				Amount:   100,
+				Price:    11,
+				Time:     10000,
+				BrokerID: int32(myBrokerId.GetID()),
+			},
+			partial: false,
+		},
+		{
+			deal: &exchange.Deal{
+				Ticker:   "IMOEX",
+				Amount:   -100,
+				Price:    11,
+				Time:     10000,
+				BrokerID: int32(myBrokerId.GetID()),
+			},
+			partial: true,
+		},
+		{
+			deal: &exchange.Deal{
+				Ticker:   "IMOEX",
+				Amount:   10,
+				Price:    11,
+				Time:     10000,
+				BrokerID: int32(myBrokerId.GetID()),
+			},
+			partial: false,
+		},
+	}
+
+	for i, deal := range deals {
+		dealID, err := client.Create(ctx, deal.deal)
+		if err != nil {
+			t.Error("Create return err: ", err)
+		}
+		deals[i].dealID = dealID
+		time.Sleep(time.Nanosecond * 3)
+	}
+
+	stream, err := client.Results(ctx, myBrokerId)
+	if err != nil {
+		t.Error("Results return err: ", err)
+	}
+
+	for i := 0; i < 4; i++ {
+		_, err = stream.Recv()
+		if err == io.EOF {
+			t.Error("stream closed from server side")
+			return
+		}
+		if err != nil {
+			t.Errorf("receive error %v", err)
+		}
+	}
+
+	ex.brokers.b[myBrokerId.ID].close <- struct{}{}
+
+	_, err = stream.Recv()
+	if err == nil {
+		t.Errorf(" stream must close from server side: %s ", err)
 	}
 
 }

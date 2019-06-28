@@ -18,35 +18,18 @@ import (
 // мы каждую секнуду будем получать отсюда событие с ценами, которые броке аггрегирует у себя в минуты и показывает клиентам
 // устанавливается 1 раз брокером
 func (ex *ExchangeServer) Statistic(id *exchange.BrokerID, stream exchange.Exchange_StatisticServer) error {
-
-	// if _, exist := ex.brokers.statStreams[id.GetID()]; exist == true {
-	// 	return nil
-	// }
-
 	ex.brokers.addStatListener(*id, stream)
-
-	if ex.statStarted {
-		return nil
-	}
-
 	wg := &sync.WaitGroup{}
-	ctx := stream.Context()
-	for _, source := range ex.dataSources {
-		wg.Add(1)
-		go func(source chan exchange.OHLCV) {
-			defer wg.Done()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case ohlcv := <-source:
-					ex.brokers.sendOHLCV(&ohlcv)
-				default:
-				}
+	wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		for {
+			select {
+			case <-ex.brokers.b[id.ID].close:
+				return
 			}
-		}(source)
-	}
-	ex.statStarted = true
+		}
+	}(wg)
 	wg.Wait()
 	return nil
 }
@@ -103,43 +86,42 @@ func (ex *ExchangeServer) Results(idBroker *exchange.BrokerID, stream exchange.E
 
 	ex.brokers.addResListener(idBroker, stream)
 
-	// get old results
-	for i := 0; i < len(ex.results); i++ { //todo add bd
+	if !ex.brokers.b[idBroker.ID].resStarted {
+		ex.brokers.numResListener++
+
+		// get old results
 		ex.mu.RLock()
-		resID := int64(ex.results[i].GetBrokerID())
+		for i := 0; i < len(ex.results); i++ { //todo add bd
+			ex.mu.RLock()
+			resID := int64(ex.results[i].BrokerID)
+			ex.mu.RUnlock()
+
+			if resID == idBroker.ID {
+
+				err := stream.Send(&ex.results[i])
+				if err != nil {
+					fmt.Println("error in send")
+					ex.mu.RUnlock()
+					return err
+				}
+			}
+		}
 		ex.mu.RUnlock()
+		ex.brokers.b[idBroker.ID].resStarted = true
+	}
 
-		if resID == idBroker.GetID() {
-
-			err := stream.Send(&ex.results[i])
-			if err != nil {
-				fmt.Println("error in send")
-				return err
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		for {
+			select {
+			case <-ex.brokers.b[idBroker.ID].close:
+				return
 			}
 		}
-	}
-
-	if ex.resStarted {
-		return nil
-	}
-	ex.resStarted = true
-
-	// get new results
-	ctx := stream.Context()
-	for {
-		select {
-		case <-ctx.Done():
-			return nil
-		case res := <-ex.res:
-			fmt.Println("send new")
-
-			if int64(res.BrokerID) == idBroker.GetID() {
-				go ex.brokers.sendRes(res)
-			}
-		default:
-			// time.Sleep(time.Millisecond * 10)
-		}
-	}
+	}(wg)
+	wg.Wait()
 
 	return nil
 }

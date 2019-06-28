@@ -13,60 +13,122 @@ import (
 var tools []string = []string{"IMOEX", "SPFB.RTS", "USD000UTSTOM"}
 
 type Brokers struct {
-	statStreams map[int64]exchange.Exchange_StatisticServer
-	statMu      sync.RWMutex
-	resStreams  map[int64]exchange.Exchange_ResultsServer
-	resMu       sync.RWMutex
+	mu              sync.RWMutex
+	b               map[int64]*Broker
+	numResListener  int
+	numStatListener int
 }
 
-func NewBrokers() *Brokers {
-	return &Brokers{
-		statStreams: make(map[int64]exchange.Exchange_StatisticServer),
-		resStreams:  make(map[int64]exchange.Exchange_ResultsServer),
-	}
+type Broker struct {
+	statMu     sync.RWMutex
+	resMu      sync.RWMutex
+	statStream exchange.Exchange_StatisticServer
+	resStream  exchange.Exchange_ResultsServer
+	close      chan struct{}
+	resStarted bool
 }
+
 func (b *Brokers) addStatListener(id exchange.BrokerID, stream exchange.Exchange_StatisticServer) {
-	b.statMu.Lock()
-	defer b.statMu.Unlock()
-	b.statStreams[id.ID] = stream
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.b[id.ID]; ok {
+		b.b[id.ID].statStream = stream
+	} else {
+		b.b[id.ID] = &Broker{
+			statStream: stream,
+			close:      make(chan struct{}),
+		}
+	}
+	b.numStatListener++
 }
-func (b *Brokers) addResListener(id *exchange.BrokerID, server exchange.Exchange_ResultsServer) {
-	b.resMu.Lock()
-	defer b.resMu.Unlock()
-	b.resStreams[id.ID] = server
+
+func (b *Brokers) addResListener(id *exchange.BrokerID, stream exchange.Exchange_ResultsServer) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if _, ok := b.b[id.ID]; ok {
+		b.b[id.ID].resStream = stream
+	}
+	b.b[id.ID] = &Broker{
+		resStream: stream,
+		close:     make(chan struct{}),
+	}
+
 }
 
 // send sends OHLCV to all brokers
-func (b *Brokers) sendOHLCV(ohlcv *exchange.OHLCV /*, wg *sync.WaitGroup*/) {
-	// todo pprof paralel send to brokers
-	b.statMu.RLock()
-	defer b.statMu.RUnlock()
-	for _, stream := range b.statStreams {
-		err := stream.Send(ohlcv)
-		if err != nil {
-			fmt.Println("Send error: ", err)
+func (b *Brokers) sendOHLCV(ohlcv *exchange.OHLCV) {
+	// todo paralel send to brokers
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	wg := &sync.WaitGroup{}
+	for _, broker := range b.b {
+		if broker.statStream == nil {
+			continue
 		}
+		wg.Add(1)
+		go func(broker *Broker, wg *sync.WaitGroup) {
+			defer wg.Done()
+			broker.statMu.RLock()
+			defer broker.statMu.RUnlock()
+
+			stream := broker.statStream
+
+			ctx := stream.Context()
+			select {
+			case <-ctx.Done():
+				broker.statStream = nil
+				broker.close <- struct{}{}
+				return
+			default:
+			}
+
+			err := stream.Send(ohlcv)
+			if err != nil {
+				fmt.Println("Send error: ", err)
+				return
+			}
+		}(broker, wg)
+
 	}
+	wg.Wait()
 }
 
 // sendRes send deal related to broker
 func (b *Brokers) sendRes(res *exchange.Deal) {
-	if len(b.resStreams) == 0 {
-		return
-	}
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	wg := &sync.WaitGroup{}
 
-	b.resMu.RLock()
-	defer b.resMu.RUnlock()
-	for idBroker, stream := range b.resStreams {
-
-		if int64(res.GetBrokerID()) == idBroker {
-			err := stream.Send(res)
-			if err != nil {
-				fmt.Println("Send error: ", err)
-			}
+	for idBroker, broker := range b.b {
+		if broker.resStream == nil {
+			continue
 		}
-	}
 
+		wg.Add(1)
+		func(wg *sync.WaitGroup) {
+			broker.resMu.RLock()
+			defer broker.resMu.RUnlock()
+			defer wg.Done()
+			stream := broker.resStream
+			ctx := stream.Context()
+			select {
+			case <-ctx.Done():
+				broker.resStream = nil
+				broker.close <- struct{}{}
+				return
+			default:
+			}
+
+			if int64(res.BrokerID) == idBroker {
+				err := stream.Send(res)
+				if err != nil {
+					fmt.Println("Send error: ", err)
+				}
+			}
+		}(wg)
+
+	}
+	wg.Wait()
 }
 
 type ExchangeServer struct {
@@ -77,9 +139,7 @@ type ExchangeServer struct {
 	tools       []string
 	stocks      map[string]*Stock
 	res         chan *exchange.Deal
-	statStarted bool
-	resStarted  bool
-	statExit    chan struct{} // chan for stoping reading statistics
+	statExit    chan struct{} // to stop reading from file
 }
 
 // Stock stores buy and sell list of deals
@@ -98,10 +158,8 @@ func NewExchangeServer() *ExchangeServer {
 
 	ex := ExchangeServer{
 		dataSources: data,
-		brokers:     NewBrokers(),
+		brokers:     &Brokers{b: make(map[int64]*Broker)},
 		tools:       tools,
-		statStarted: false,
-		resStarted:  false,
 		statExit:    make(chan struct{}),
 		res:         make(chan *exchange.Deal),
 	}
@@ -119,13 +177,28 @@ func NewExchangeServer() *ExchangeServer {
 	}
 	ex.stocks = stocks
 
-	return &ex
-}
+	go ex.startStatistic()
+	go ex.startResults()
 
-func (ex *ExchangeServer) start() {
 	fmt.Println("stock starts")
 	for _, tool := range ex.tools {
 		go ex.workTool(tool)
+	}
+	return &ex
+}
+
+func (ex *ExchangeServer) startStatistic() {
+	fmt.Println("Statisitc starts")
+	for _, source := range ex.dataSources {
+		for ohlcv := range source {
+			ex.brokers.sendOHLCV(&ohlcv)
+		}
+	}
+}
+func (ex *ExchangeServer) startResults() {
+	fmt.Println("Results starts")
+	for res := range ex.res {
+		ex.brokers.sendRes(res)
 	}
 }
 
@@ -158,10 +231,6 @@ func (ex *ExchangeServer) workTool(tool string) {
 
 		// Pop deals from heaps
 		fmt.Println("WorkerTool continues " + tool)
-		fmt.Println(bestBuyPrice)
-		fmt.Println(curBuyPr)
-		fmt.Println(bestSellPrice)
-		fmt.Println(curSellPr)
 		fmt.Println(ex.stocks[tool].buy.Query.data)
 		fmt.Println(ex.stocks[tool].sell.Query.data)
 
@@ -239,9 +308,9 @@ func (ex *ExchangeServer) workTool(tool string) {
 			}
 
 			// inform listeners
-			ex.brokers.resMu.RLock()
-			brNum := len(ex.brokers.resStreams)
-			ex.brokers.resMu.RUnlock()
+			ex.brokers.mu.RLock()
+			brNum := ex.brokers.numResListener
+			ex.brokers.mu.RUnlock()
 
 			if brNum != 0 {
 				ex.res <- sellDeal
