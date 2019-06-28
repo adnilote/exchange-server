@@ -17,7 +17,8 @@ client
 load test sniper
 pprof
 -race
-exchange-server write results to db
+exchange-server: write results to db
+exchange-server: identify brokers
 
 ## Биржа
 
