@@ -39,8 +39,8 @@ func (b *Brokers) addResListener(id *exchange.BrokerID, server exchange.Exchange
 // send sends OHLCV to all brokers
 func (b *Brokers) sendOHLCV(ohlcv *exchange.OHLCV /*, wg *sync.WaitGroup*/) {
 	// todo pprof paralel send to brokers
-	b.statMu.Lock()
-	defer b.statMu.Unlock()
+	b.statMu.RLock()
+	defer b.statMu.RUnlock()
 	for _, stream := range b.statStreams {
 		err := stream.Send(ohlcv)
 		if err != nil {
@@ -55,8 +55,8 @@ func (b *Brokers) sendRes(res *exchange.Deal) {
 		return
 	}
 
-	b.resMu.Lock()
-	defer b.resMu.Unlock()
+	b.resMu.RLock()
+	defer b.resMu.RUnlock()
 	for idBroker, stream := range b.resStreams {
 
 		if int64(res.GetBrokerID()) == idBroker {
