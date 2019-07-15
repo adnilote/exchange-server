@@ -6,19 +6,18 @@
 EXCHANGE-SERVER < --- grpc --- > BROKER <--- rest --- > CLIENT
                                           (not done)
 
-## DONE
-exchange-server
-exchange-server GRPC testing with bufconn
-
-## TODO
-broker
-client
-
-load test sniper
-pprof
--race
-exchange-server: write results to db
-exchange-server: identify brokers
+## TASK
+- [x] exchange-server 
+- [x] GRPC 
+- [x] testing with bufconn
+- [ ] broker
+- [ ] client
+- [ ] load test sniper
+- [ ] pprof
+- [ ] -race
+- [ ] exchange-server: write results to Redis
+- [ ] exchange-server: identify brokers
+- [ ] memcache
 
 ## Биржа
 
@@ -38,7 +37,7 @@ exchange-server: identify brokers
 
 Брокер аггрегирует внутри себя информацию от биржи по ценовым данным, позволяя клиенту посмотреть историю. По-умолчанию, хранится история за последнеи 5 минут (300 секунд).
 
-Брокер предоставляет клиентам JSON-апи (REST или JSON-RPC), через который им доступныы следующие возможности:
+Брокер предоставляет клиентам JSON-апи (REST), через который им доступныы следующие возможности:
 * посмотреть свои позиции и баланс - возвращает баланс + список заявок ( слайс структур ), может быть преобразовано в таблицу на хтмл
 * отправить на биржу заявку на покупку или продажу тикера ( то что вы видите на скрине у клиента )
 * отменить ранее отправленную заявку - принимает ИД заявки
